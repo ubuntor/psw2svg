@@ -1,2 +1,7 @@
 # psw2svg
-Pocket Word PSW/PWI drawings to SVG (WIP)
+Requires [drawsvg](https://pypi.org/project/drawsvg/).
+
+Usage:
+```
+parse.py [input psw/pwi file] [output svg file]
+```
