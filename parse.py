@@ -11,6 +11,23 @@ COLORS = [
 	(0,0,132), (0,130,132),	(132,0,132), (132, 130, 0)
 ]
 
+PARAGRAPH_COMMAND_LEN = {
+    0xc1:1,
+    0xc2:2,
+    0xc3:2,
+    0xc4:1,
+    0xc5:2,
+    0xe5:2,
+    0xe6:2,
+    0xe7:2,
+    0xe8:2,
+    0xe9:1,
+    0xea:1,
+    0xeb:1,
+    0xec:1,
+    0xef:3
+}
+
 class Buffer:
     def __init__(self, b):
         self.raw = b
@@ -34,6 +51,8 @@ class Buffer:
         return self.read(1)[0]
     def read_u16(self):
         return struct.unpack("<H", self.read(2))[0]
+    def read_u32(self):
+        return struct.unpack("<I", self.read(4))[0]
 
 class CompressedIntBuffer:
     def __init__(self, b):
@@ -77,6 +96,26 @@ class CompressedIntBuffer:
 def format_color(x):
     return f'rgb({x[0]}, {x[1]}, {x[2]})'
 
+def decode_polyline(data, offset):
+    if data.peek_u8() >= 0xf0:
+        # -- -- [num_bytes num_bytes] [num_points num_points] [base_x base_x] [base_y base_y]
+        data.read(2)
+        num_bytes = data.read_u16()-10
+        num_points = data.read_u16()
+        x, y = offset[0]+data.read_u16(), offset[1]-data.read_u16()
+    else:
+        # num_points num_bytes base_x base_y
+        num_points = data.read_u8()
+        num_bytes = data.read_u8()-4
+        x, y = offset[0]+data.read_u8(), offset[1]-data.read_u8()
+    coords = [x, y]
+    compressed_data = CompressedIntBuffer(data.read(num_bytes))
+    for _ in range(num_points-1):
+        x += compressed_data.read_compressed_int()
+        y -= compressed_data.read_compressed_int()
+        coords += [x,y]
+    return coords
+
 if __name__ == '__main__':
     if len(sys.argv) <= 2:
         print(f'usage: {sys.argv[0]} [input psw/pwi file] [output svg file]')
@@ -88,15 +127,14 @@ if __name__ == '__main__':
         sys.exit(1)
 
     svg = drawsvg.Drawing(100, 100)
-
+    chunks = {}
     bounds = [100, 100]
     version = b.read_u16()
-    b.read_u16() # TODO: ???
-    text_cursor = [0, 0]
-    drawing_origin = (0, 0)
-    drawing_size = (0, 0)
-    # what on earth is up with these coordinate systems???
-    # shape coordinates use +y=up, drawing origins use +y=up (but +lines=down)
+    print(f'version {version}')
+    if version != 6:
+        print(f'WARNING: unsupported version, might not work')
+    b.read_u16()
+
     while not b.eof():
         _type = b.read_u16()
         _id = b.read_u16()
@@ -104,91 +142,121 @@ if __name__ == '__main__':
         if _type != 85:
             length *= 4
         data = Buffer(b.read(length))
-        #print(_type, hex(_id))
-        if _type == 131: # drawing info
-            # TODO: instead of storing drawing state, lookup the shapes by the ids
-            data.read(8) # TODO: ???
+        chunks[_id] = (_type, data)
+
+    # parse paragraphs (id 8)
+    if 8 not in chunks:
+        print('WARNING: no paragraphs?')
+    else:
+        _, data = chunks[8]
+        num_paragraphs = data.read_u32()
+        data.read_u32() # total lines?
+        data.read_u32() # total chars?
+        data.read_u32() # ???
+        data.read_u32() # 0?
+        data.read_u32() # 0?
+        paragraph_ids = []
+        for _ in range(num_paragraphs):
+            data.read(4)
+            paragraph_ids.append(data.read_u16())
+            data.read(2)
+        cursor = [0, 0]
+        print('paragraphs:', paragraph_ids)
+        for paragraph_id in paragraph_ids:
+            cursor[1] += 72
+            if paragraph_id == 0: # ???
+                continue
+            _, data = chunks[paragraph_id]
+            data.read(8)
+            paragraph_dim_id = data.read_u16()
+            data.read(4)
+            left_margin = data.read_u16()
+            cursor[0] = left_margin
+            data.read(8)
+            while not data.eof():
+                cmd = data.read_u8()
+                args = Buffer(data.read(PARAGRAPH_COMMAND_LEN[cmd]))
+                if cmd == 0xc2: # picture
+                    picture_id = args.read_u16()
+                    _type, picture_data = chunks[picture_id]
+                    if _type != 67:
+                        print(f'WARNING: unimplemented picture type {_type}')
+                        continue
+                    print('picture', picture_id)
+                    picture_data.read(4) # TODO: ???
+                    width = picture_data.read_u16()
+                    num_lines = picture_data.read_u16()
+                    picture_data.read(2) # TODO: ???
+                    print('num lines:', num_lines)
+                    for _ in range(num_lines):
+                        coords = decode_polyline(picture_data, cursor)
+                        svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4)) # ???
+                    cursor[0] += width
+                elif cmd == 0xc3: # sep
+                    cursor[0] += args.read_u16()
+                elif cmd == 0xc4: # end
+                    break
+                elif cmd == 0xe5: # font
+                    pass
+                else:
+                    print(f'WARNING: unsupported paragraph command {hex(cmd)}')
+
+    # parse drawings (id 9)
+    if 9 not in chunks:
+        print('WARNING: no drawings?')
+    else:
+        _, data = chunks[9]
+        data.read(2)
+        num_drawings = data.read_u16()
+        data.read(8)
+        drawing_ids = []
+        for _ in range(num_drawings):
+            drawing_ids.append(data.read_u16())
+        print('drawings:', drawing_ids)
+        for drawing_id in drawing_ids:
+            _, data = chunks[drawing_id]
+            data.read(2)
+            num_shapes = data.read_u16()
+            data.read(4)
             line = data.read_u16()
-            data.read(2) # TODO: ???
-            drawing_origin = (data.read_u16(), (line+1)*72-data.read_u16()) # TODO: line height?
+            data.read(2)
+            drawing_origin = (data.read_u16(), (line+1)*16-data.read_u16()) # TODO: line height?
             drawing_size = (data.read_u16(), data.read_u16())
+            data.read(8)
+            shape_ids = []
+            for _ in range(num_shapes):
+                shape_ids.append(data.read_u16())
+            print(f'drawing {drawing_id}: shapes:', shape_ids)
+            #print(drawing_origin, drawing_size, drawing_origin[1]-line*25, line)
             bounds[0] = max(bounds[0], drawing_origin[0]+drawing_size[0])
             bounds[1] = max(bounds[1], drawing_origin[1]+drawing_size[1])
-            svg.append(drawsvg.Rectangle(*drawing_origin, *drawing_size, fill='none', stroke='red', stroke_width=1)) # TODO: delet this
-            svg.append(drawsvg.Text(f'{drawing_origin}, {drawing_size}, {drawing_origin[1]-line*72}, {line}', font_size=20, font_family='sansserif', x=drawing_origin[0], y=drawing_origin[1])) # TODO: delet this
-        elif _type == 103: # polyline
-            data.read(3) # TODO: ???
-            color = data.read_u8()
-            stroke = COLORS[color & 0xf]
-            fill = COLORS[color >> 4]
-            width = data.read_u8()
-            is_filled = bool(data.read_u8())
-            data.read(6) # TODO: ???
-            offset = (drawing_origin[0]+data.read_u16(), drawing_origin[1]+drawing_size[1]-data.read_u16())
-            size = (data.read_u16(), data.read_u16())
-            transform = data.read(20)
-            if transform != bytes.fromhex('0000010000000100000000000000000000000000'):
-                print('WARNING: polyline transform unimplemented')
-            if data.peek_u8() >= 0xf0:
-                # -- -- [f2 f2] [num_points num_points] [base_x base_x] [base_y base_y]
-                data.read_u16()
-                f2 = data.read_u16()
-                num_points = data.read_u16()
-                x, y = offset[0]+data.read_u16(), offset[1]-data.read_u16()
-            else:
-                # num_points f2 base_x base_y
-                num_points = data.read_u8()
-                f2 = data.read_u8()
-                x, y = offset[0]+data.read_u8(), offset[1]-data.read_u8()
-            coords = [x, y]
-            data = CompressedIntBuffer(data.readall())
-            for _ in range(num_points-1):
-                x += data.read_compressed_int()
-                y -= data.read_compressed_int()
-                coords += [x,y]
-            if is_filled:
-                svg.append(drawsvg.Lines(*coords, fill=format_color(fill), stroke=format_color(stroke), stroke_width=width, close='true'))
-            else:
-                svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(stroke), stroke_width=width))
-        elif _type == 67: # inline polyline
-            print('WARNING: inline polyline not fully implemented')
-            data.read(4) # TODO: ???
-            width = data.read_u16()
-            data.read(4) # TODO: ???
-            if data.peek_u8() >= 0xf0:
-                # -- -- [f2 f2] [num_points num_points] [base_x base_x] [base_y base_y]
-                data.read_u16()
-                f2 = data.read_u16()
-                num_points = data.read_u16()
-                x, y = text_cursor[0]+data.read_u16(), text_cursor[1]+data.read_u16()
-            else:
-                # num_points f2 base_x base_y
-                num_points = data.read_u8()
-                f2 = data.read_u8()
-                x, y = text_cursor[0]+data.read_u8(), text_cursor[1]+data.read_u8()
-            coords = [x, y]
-            data = CompressedIntBuffer(data.readall())
-            for _ in range(num_points-1):
-                x += data.read_compressed_int()
-                y -= data.read_compressed_int()
-                coords += [x,y]
-            svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4)) # ???
-            text_cursor[0] += width # TODO: ???
-        elif _type == 65: # paragraph?
-            pass
-        elif _type == 66: # paragraph?
-            text_cursor[0] = 0
-            text_cursor[1] += 50 # TODO: ???
-        elif _type == 102:
-            print('WARNING: group unimplemented!')
-        elif _type == 104:
-            print('WARNING: rectangle unimplemented!')
-        elif _type == 105:
-            print('WARNING: circle unimplemented!')
-        elif _type == 106:
-            print('WARNING: line unimplemented!')
-        elif _type == 107:
-            print('WARNING: triangle unimplemented!')
+            drawing = drawsvg.Group(id=f'drawing_{drawing_id}')
+            drawing.append(drawsvg.Rectangle(*drawing_origin, *drawing_size, fill='none', stroke='red', stroke_width=1)) # TODO: delet this
+            drawing.append(drawsvg.Text(f'{drawing_origin}, {drawing_size}, {drawing_origin[1]-line*72}, {line}', font_size=20, font_family='sansserif', x=drawing_origin[0], y=drawing_origin[1])) # TODO: delet this
+            for shape_id in shape_ids:
+                _type, data = chunks[shape_id]
+                if _type != 103:
+                    print(f'WARNING: unimplemented shape type {_type}')
+                    continue
+                # type 103: polyline
+                data.read(3)
+                color = data.read_u8()
+                stroke = COLORS[color & 0xf]
+                fill = COLORS[color >> 4]
+                width = data.read_u8()
+                is_filled = bool(data.read_u8())
+                data.read(6)
+                offset = (drawing_origin[0]+data.read_u16(), drawing_origin[1]+drawing_size[1]-data.read_u16())
+                size = (data.read_u16(), data.read_u16())
+                transform = data.read(20)
+                if transform != bytes.fromhex('0000010000000100000000000000000000000000'):
+                    print('WARNING: polyline transform unimplemented:', transform.hex())
+                coords = decode_polyline(data, offset)
+                if is_filled:
+                    drawing.append(drawsvg.Lines(*coords, fill=format_color(fill), stroke=format_color(stroke), stroke_width=width, close='true'))
+                else:
+                    drawing.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(stroke), stroke_width=width))
+            svg.append(drawing)
 
     svg.width = bounds[0]
     svg.height = bounds[1]
