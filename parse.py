@@ -8,7 +8,7 @@ COLORS = [
 	(0,0,0), (132,130,132), (198,195,198), (255,255,255),
 	(255,0,0), (0,255,0), (0,0,255), (0,255,255),
 	(255,0,255), (0,255,255), (132,0,0), (0,130,0),
-	(0,0,132), (0,130,132),	(132,0,132), (132, 130, 0)
+	(0,0,132), (0,130,132),	(132,0,132), (132,130,0)
 ]
 
 PARAGRAPH_COMMAND_LEN = {
@@ -51,6 +51,8 @@ class Buffer:
         return self.read(1)[0]
     def read_u16(self):
         return struct.unpack("<H", self.read(2))[0]
+    def read_s16(self):
+        return struct.unpack("<h", self.read(2))[0]
     def read_u32(self):
         return struct.unpack("<I", self.read(4))[0]
 
@@ -144,6 +146,8 @@ if __name__ == '__main__':
         data = Buffer(b.read(length))
         chunks[_id] = (_type, data)
 
+    # TODO: what even are units??? pixels? pt?
+
     # parse paragraphs (id 8)
     if 8 not in chunks:
         print('WARNING: no paragraphs?')
@@ -155,42 +159,47 @@ if __name__ == '__main__':
         data.read_u32() # ???
         data.read_u32() # 0?
         data.read_u32() # 0?
-        paragraph_ids = []
+        paragraphs = []
         for _ in range(num_paragraphs):
-            data.read(4)
-            paragraph_ids.append(data.read_u16())
+            num_lines = data.read_u16()
             data.read(2)
+            paragraph_id = data.read_u16()
+            data.read(2)
+            paragraphs.append((paragraph_id, num_lines))
         cursor = [0, 0]
-        print('paragraphs:', paragraph_ids)
-        for paragraph_id in paragraph_ids:
-            cursor[1] += 72
+        print('paragraphs:', paragraphs)
+        for paragraph_id, num_lines in paragraphs:
+            cursor[1] += 72*num_lines
             if paragraph_id == 0: # ???
                 continue
             _, data = chunks[paragraph_id]
             data.read(8)
             paragraph_dim_id = data.read_u16()
+            _, paragraph_dim_data = chunks[paragraph_dim_id]
             data.read(4)
-            left_margin = data.read_u16()
-            cursor[0] = left_margin
+            left_margin = data.read_s16()
+            cursor[0] = left_margin # TODO: idk, this might need an additional offset from page dims
             data.read(8)
             while not data.eof():
                 cmd = data.read_u8()
+                if cmd not in PARAGRAPH_COMMAND_LEN:
+                    # TODO: maybe add something to cursor[0]
+                    continue
                 args = Buffer(data.read(PARAGRAPH_COMMAND_LEN[cmd]))
                 if cmd == 0xc2: # picture
+                    print('WARNING: inline pictures not fully implemented')
                     picture_id = args.read_u16()
                     _type, picture_data = chunks[picture_id]
                     if _type != 67:
                         print(f'WARNING: unimplemented picture type {_type}')
                         continue
-                    print('picture', picture_id)
-                    picture_data.read(4) # TODO: ???
+                    picture_data.read(4)
                     width = picture_data.read_u16()
                     num_lines = picture_data.read_u16()
-                    picture_data.read(2) # TODO: ???
-                    print('num lines:', num_lines)
+                    picture_data.read(2)
                     for _ in range(num_lines):
                         coords = decode_polyline(picture_data, cursor)
-                        svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4)) # ???
+                        svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4))
                     cursor[0] += width
                 elif cmd == 0xc3: # sep
                     cursor[0] += args.read_u16()
@@ -220,19 +229,17 @@ if __name__ == '__main__':
             data.read(4)
             line = data.read_u16()
             data.read(2)
-            drawing_origin = (data.read_u16(), (line+1)*16-data.read_u16()) # TODO: line height?
+            # TODO: line height? seems to be fixed at 72 for Notes?
+            drawing_origin = (data.read_s16(), (line+1)*72-data.read_s16())
             drawing_size = (data.read_u16(), data.read_u16())
             data.read(8)
             shape_ids = []
             for _ in range(num_shapes):
                 shape_ids.append(data.read_u16())
             print(f'drawing {drawing_id}: shapes:', shape_ids)
-            #print(drawing_origin, drawing_size, drawing_origin[1]-line*25, line)
             bounds[0] = max(bounds[0], drawing_origin[0]+drawing_size[0])
             bounds[1] = max(bounds[1], drawing_origin[1]+drawing_size[1])
             drawing = drawsvg.Group(id=f'drawing_{drawing_id}')
-            drawing.append(drawsvg.Rectangle(*drawing_origin, *drawing_size, fill='none', stroke='red', stroke_width=1)) # TODO: delet this
-            drawing.append(drawsvg.Text(f'{drawing_origin}, {drawing_size}, {drawing_origin[1]-line*72}, {line}', font_size=20, font_family='sansserif', x=drawing_origin[0], y=drawing_origin[1])) # TODO: delet this
             for shape_id in shape_ids:
                 _type, data = chunks[shape_id]
                 if _type != 103:
@@ -246,7 +253,7 @@ if __name__ == '__main__':
                 width = data.read_u8()
                 is_filled = bool(data.read_u8())
                 data.read(6)
-                offset = (drawing_origin[0]+data.read_u16(), drawing_origin[1]+drawing_size[1]-data.read_u16())
+                offset = (drawing_origin[0]+data.read_s16(), drawing_origin[1]+drawing_size[1]-data.read_s16())
                 size = (data.read_u16(), data.read_u16())
                 transform = data.read(20)
                 if transform != bytes.fromhex('0000010000000100000000000000000000000000'):
