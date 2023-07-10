@@ -1,5 +1,5 @@
 # partially based on libwps
-
+import bisect
 import struct
 import sys
 import drawsvg # https://pypi.org/project/drawsvg/
@@ -36,10 +36,6 @@ class Buffer:
         ret = self.raw[self.fp : self.fp + n]
         self.fp += n
         return ret
-    def readall(self):
-        ret = self.raw[self.fp :]
-        self.fp = len(self.raw)
-        return ret
     def peek(self, n):
         ret = self.raw[self.fp : self.fp + n]
         return ret
@@ -48,7 +44,9 @@ class Buffer:
     def peek_u8(self):
         return self.peek(1)[0]
     def read_u8(self):
-        return self.read(1)[0]
+        return struct.unpack("<B", self.read(1))[0]
+    def read_s8(self):
+        return struct.unpack("<b", self.read(1))[0]
     def read_u16(self):
         return struct.unpack("<H", self.read(2))[0]
     def read_s16(self):
@@ -104,12 +102,12 @@ def decode_polyline(data, offset):
         data.read(2)
         num_bytes = data.read_u16()-10
         num_points = data.read_u16()
-        x, y = offset[0]+data.read_u16(), offset[1]-data.read_u16()
+        x, y = offset[0]+data.read_u16(), offset[1]-data.read_s16() # ?????????
     else:
         # num_points num_bytes base_x base_y
         num_points = data.read_u8()
         num_bytes = data.read_u8()-4
-        x, y = offset[0]+data.read_u8(), offset[1]-data.read_u8()
+        x, y = offset[0]+data.read_u8(), offset[1]-data.read_s8() # ?????????
     coords = [x, y]
     compressed_data = CompressedIntBuffer(data.read(num_bytes))
     for _ in range(num_points-1):
@@ -147,68 +145,77 @@ if __name__ == '__main__':
         chunks[_id] = (_type, data)
 
     # TODO: what even are units??? pixels? pt?
+    cum_chars_by_line = []
 
     # parse paragraphs (id 8)
     if 8 not in chunks:
-        print('WARNING: no paragraphs?')
-    else:
-        _, data = chunks[8]
-        num_paragraphs = data.read_u32()
-        data.read_u32() # total lines?
-        data.read_u32() # total chars?
-        data.read_u32() # ???
-        data.read_u32() # 0?
-        data.read_u32() # 0?
-        paragraphs = []
-        for _ in range(num_paragraphs):
-            num_lines = data.read_u16()
-            data.read(2)
-            paragraph_id = data.read_u16()
-            data.read(2)
-            paragraphs.append((paragraph_id, num_lines))
-        cursor = [0, 0]
-        print('paragraphs:', paragraphs)
-        for paragraph_id, num_lines in paragraphs:
-            cursor[1] += 72*num_lines
-            if paragraph_id == 0: # ???
+        print('ERROR: no paragraphs?')
+        sys.exit(1)
+    _, data = chunks[8]
+    num_paragraphs = data.read_u32()
+    data.read_u32() # total lines?
+    data.read_u32() # total chars?
+    data.read_u32() # ???
+    data.read_u32() # 0?
+    data.read_u32() # 0?
+    paragraphs = []
+    cum_chars = 0
+    for _ in range(num_paragraphs):
+        cum_chars_by_line.append(cum_chars)
+        num_lines = data.read_u16()
+        num_chars = data.read_u16()
+        cum_chars += num_chars
+        paragraph_id = data.read_u16()
+        data.read(2)
+        paragraphs.append((paragraph_id, num_lines))
+    cum_chars_by_line.append(cum_chars)
+    cursor = [0, 0]
+    print('paragraphs:', paragraphs)
+    for paragraph_id, num_lines in paragraphs:
+        cursor[1] += 72*num_lines
+        if paragraph_id == 0: # ???
+            continue
+        _, data = chunks[paragraph_id]
+        data.read(8)
+        paragraph_dim_id = data.read_u16()
+        _, paragraph_dim_data = chunks[paragraph_dim_id]
+        data.read(4)
+        left_margin = data.read_s16()
+        cursor[0] = left_margin # TODO: idk, this might need an additional offset from page dims
+        data.read(8)
+        while not data.eof():
+            cmd = data.read_u8()
+            if cmd not in PARAGRAPH_COMMAND_LEN:
+                # text character
+                # TODO: maybe add something to cursor[0]
                 continue
-            _, data = chunks[paragraph_id]
-            data.read(8)
-            paragraph_dim_id = data.read_u16()
-            _, paragraph_dim_data = chunks[paragraph_dim_id]
-            data.read(4)
-            left_margin = data.read_s16()
-            cursor[0] = left_margin # TODO: idk, this might need an additional offset from page dims
-            data.read(8)
-            while not data.eof():
-                cmd = data.read_u8()
-                if cmd not in PARAGRAPH_COMMAND_LEN:
-                    # TODO: maybe add something to cursor[0]
+            args = Buffer(data.read(PARAGRAPH_COMMAND_LEN[cmd]))
+            if cmd == 0xc2: # picture
+                print('WARNING: inline pictures not fully implemented')
+                picture_id = args.read_u16()
+                _type, picture_data = chunks[picture_id]
+                if _type != 67:
+                    print(f'WARNING: unimplemented picture type {_type}')
                     continue
-                args = Buffer(data.read(PARAGRAPH_COMMAND_LEN[cmd]))
-                if cmd == 0xc2: # picture
-                    print('WARNING: inline pictures not fully implemented')
-                    picture_id = args.read_u16()
-                    _type, picture_data = chunks[picture_id]
-                    if _type != 67:
-                        print(f'WARNING: unimplemented picture type {_type}')
-                        continue
-                    picture_data.read(4)
-                    width = picture_data.read_u16()
-                    num_lines = picture_data.read_u16()
-                    picture_data.read(2)
-                    for _ in range(num_lines):
-                        coords = decode_polyline(picture_data, cursor)
-                        svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4))
-                    cursor[0] += width
-                elif cmd == 0xc3: # sep
-                    cursor[0] += args.read_u16()
-                elif cmd == 0xc4: # end
-                    break
-                elif cmd == 0xe5: # font
-                    pass
-                else:
-                    print(f'WARNING: unsupported paragraph command {hex(cmd)}')
+                print('inline picture', picture_id)
+                picture_data.read(4)
+                width = picture_data.read_u16()
+                num_lines = picture_data.read_u16()
+                picture_data.read(2)
+                for _ in range(num_lines):
+                    coords = decode_polyline(picture_data, cursor)
+                    svg.append(drawsvg.Lines(*coords, fill='none', stroke=format_color(COLORS[0]), stroke_width=4))
+                    bounds[1] = max(bounds[1], max(coords[1::2])+4)
+                cursor[0] += width
+                bounds[0] = max(bounds[0], cursor[0])
+            elif cmd == 0xc3: # sep
+                cursor[0] += args.read_u16()
+            elif cmd == 0xc4: # end
+                break
+            elif cmd == 0xe5: # font
+                pass
+            else:
+                print(f'WARNING: unsupported paragraph command {hex(cmd)}')
 
     # parse drawings (id 9)
     if 9 not in chunks:
@@ -227,10 +234,12 @@ if __name__ == '__main__':
             data.read(2)
             num_shapes = data.read_u16()
             data.read(4)
-            line = data.read_u16()
+            char_offset = data.read_u16()
             data.read(2)
-            # TODO: line height? seems to be fixed at 72 for Notes?
-            drawing_origin = (data.read_s16(), (line+1)*72-data.read_s16())
+            # find line that contains the char_offset'th char
+            line = bisect.bisect_right(cum_chars_by_line, char_offset)-1
+            # TODO: char_offset might also affect x
+            drawing_origin = (data.read_s16(), (line+1)*72-data.read_s16()) # TODO: line height is fixed at 72?
             drawing_size = (data.read_u16(), data.read_u16())
             data.read(8)
             shape_ids = []
